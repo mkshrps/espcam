@@ -1,10 +1,13 @@
+#define _MAIN_
 #include <Arduino.h>
 #include <esp_camera.h>
 #include <WiFi.h>
-
 #include <SPI.h>
 #include <Wire.h>
 #include <LoRa_LIB.h>
+#include <Wire.h>
+#include <TinyGPSPlus.h>
+#include <main.h>
 
 // Time
 #include <time.h>
@@ -17,6 +20,10 @@
 #include <esp_vfs_fat.h>
 #include <ssdv.h>
 
+#define LORA_CSS  15   // will be 2,4 or 15 (Standard HSPI = 15) 
+
+// The TinyGPS++ object
+TinyGPSPlus gps;
 
 // Edit ssid, password, capture_interval:
 const char* ssid = "NSA";
@@ -62,122 +69,278 @@ bool firstRun = false;
 #define JPEG_RESOLUTION             4                                // 0-8 corresponfing to 320x240, 352x288, 640x480, 800x480, 1024x768, 1280x960, 1600x1200, 2048x1536, 2592x1944
 #define JPEG_QUALITY                3                                // 0-16 corresponding to 96.7, 93.7, 87.3, 81.2, 74.8, 68.6, 62.3, 56.2, 50.0, 44.4, 39.9, 36.3, 33.2, 30.7, 28.5, 26.6, 25.8
 #define SSDV_QUALITY                4                                // 0-7 corresponding to JPEG quality: 13, 18, 29, 43, 50, 71, 86 and 100
-#define IMG_BUFF_SIZE               128                               // size of the buffer feeding SSDV process (decreased to 32 bytes to save RAM)
-#define INTERLEAVE_TELEM            50                               // transmit a telemetry packet every X SSDV packets
+#define IMG_BUFF_SIZE               128                               // size of the buffer feeding SSDV process 
+#define INTERLEAVE_TELEM            5                               // transmit a telemetry packet every X SSDV packets
 #define LORA_BUFFER 255;
 
 static esp_err_t init_sdcard();
 
-static const uint8_t callsign[] = "MJS01";                    // maximum of 6 characters
-uint8_t IMG_res                     = JPEG_RESOLUTION;
-uint8_t IMG_quality                 = JPEG_QUALITY;
-uint32_t IMG_size                   = 0;
-uint32_t IMG_count                  = 1;
-uint8_t SSDV_quality                = SSDV_QUALITY;
-uint8_t IMG_buff[IMG_BUFF_SIZE];
+static const char callsign[] = "MJS01";                    // maximum of 6 characters
+uint8_t jpgRes                     = JPEG_RESOLUTION;
+uint8_t jpgQuality                 = JPEG_QUALITY;
+uint32_t imgSize                   = 0;
+uint32_t imgCount                  = 1;
+uint8_t ssdvQuality                = SSDV_QUALITY;
+uint8_t imgBuff[IMG_BUFF_SIZE];
 ssdv_t ssdv;
-uint8_t LORA_pkt[256];
+uint8_t loraBuff[256];
+char tempStr[40];
+char gpsMessage[256];
+
+bool gpsSerialActive = false;
 
 int imageID = 0;
 
-  int iread(uint8_t *buffer,int numBytes,camera_fb_t *fb, int fbIndex ){
 
-    int bufSize = 0;
-    // have we reached past end of imagebuffer
-    if((fbIndex + numBytes ) < fb->len){
-      bufSize = numBytes;
-    }
-    else{
-      bufSize = fb->len - fbIndex;
-    }
-    // clear the dest buffer
-    memset(buffer,0,numBytes);
-    memcpy(buffer,&fb->buf[fbIndex],bufSize);
-    return bufSize;
+int iread(uint8_t *buffer,int numBytes,camera_fb_t *fb, int fbIndex ){
+
+  int bufSize = 0;
+  // have we reached past end of imagebuffer
+  if((fbIndex + numBytes ) < fb->len){
+  
+    bufSize = numBytes;
+  }
+  else{
+
+    bufSize = fb->len - fbIndex;
+  }
+  // clear the dest buffer
+  memset(buffer,0,numBytes);
+  memcpy(buffer,&fb->buf[fbIndex],bufSize);
+  return bufSize;
+}
+
+
+int checkGps(){
+  //delay(1000);
+  
+  gpsSerialActive = false;
+  while (Serial2.available() > 0){
+
+    gpsSerialActive = true;
+    gps.encode(Serial2.read());
 
   }
-
-  int process_ssdv(camera_fb_t *fb){
-
-    int index=0,c = 0,i=0;
-
-    // initialise ssdv config structure
-    ssdv_enc_init(&ssdv, SSDV_TYPE_NOFEC, (char *)callsign, imageID++, SSDV_quality);
-    // set the output lora packet buffer for ssdv where the final ssdv packet will end up
-    ssdv_enc_set_buffer(&ssdv, LORA_pkt);
-    Serial.print("Sending Image: length = ");
-    Serial.println(fb->len);
-
-    while(1){
-      while((c = ssdv_enc_get_packet(&ssdv)) == SSDV_FEED_ME)
-      {
-          //size_t r = fread(imageBuffer, 1, 128, fin);
-          //Serial.print("read into buffer");
-          // read packet worth of bytes from image buffer
-          index += iread(IMG_buff, IMG_BUFF_SIZE,fb,index);
-          Serial.print("index = ");
-          Serial.print(index);
-          
-          // ssdv =  struct, imageBuffer = buffer containing image packet, r = size
-          ssdv_enc_feed(&ssdv, IMG_buff, IMG_BUFF_SIZE);
-          //Serial.println(" bfed ");
-      }
-      
-      if(c == SSDV_EOI)
-      {
-          Serial.println("ssdv EOI");
-          break;
-      }
-      else if(c != SSDV_OK)
-      {
-          Serial.println("ssdv Error");
-          break;
-      }
-
-      // TT7 does this in his code copies all bytes back 1. This seems needed for pits gateway to read it.
-      for(uint16_t i = 0; i < 256; i++) {LORA_pkt[i] = LORA_pkt[i+1];}
-
-      // lora transmit
-      Serial.print("packet sent");
-      Serial.println(i);
-      delay(100);
-      LoRa.beginPacket(1);          // initialise implicit/explicit mode and reset FIFO
-      LoRa.write(LORA_pkt,255);     // load data into FIFO
-      LoRa.endPacket();             // execute transmission return once complete
-      i++;
-      delay(100);
-
-      //fwrite(pkt, 1, SSDV_PKT_SIZE, fout);
-      
-    }
+  if(gpsSerialActive){
+    Serial.println("gps serial active");
   }
+
+  //  Serial.println("\n decoded GPS");
+  
+  if(gps.location.isUpdated()){
+
+    if (gps.location.isValid()){
+      GPS.Longitude = (float) gps.location.lng();
+      GPS.Latitude = (float) gps.location.lat();
+    }
+
+    if (gps.altitude.isValid()){
+      GPS.Altitude = (long) gps.altitude.meters();
+    }
+
+    // if gps data is ready
+    if (gps.location.isValid() && gps.altitude.isValid()){
+      GPS.isValid = true;
+      //Serial.println("values valid");
+    }
+
     
+    if(gps.time.isValid() && gps.time.isUpdated() ){
+    GPS.Hours = (uint8_t) gps.time.hour();
+    GPS.Minutes = (uint8_t) gps.time.minute();
+    GPS.Seconds = (uint8_t) gps.time.second();
+    }
+
+    /*
+    if(GPS.isValid ){
+      // get course and distance if we have a remote tracker
+
+      GPS.courseTo =gps.courseTo(GPS.Latitude,GPS.Longitude,remote_data.latitude,remote_data.longitude);
+      GPS.distancem = gps.distanceBetween(GPS.Latitude,GPS.Longitude,remote_data.latitude,remote_data.longitude);
+      //remote_data.cardinalCourseTo = gps.cardinal(remote_data.courseTo);
+    }
+    */
+
+  }
+    GPS.Satellites = (unsigned int) gps.satellites.value();
+    GPS.failedCS = (unsigned int) gps.failedChecksum();
+    Serial.print("Satellites ");
+    Serial.print(GPS.Satellites);
+    Serial.print(" : failed chk ");
+    Serial.print(GPS.failedCS);
+}
+
+char Hex(uint8_t index)
+  {
+    char HexTable[] = "0123456789ABCDEF";
+    
+    return HexTable[index];
+  }
+
+
+void buildPITSMessage(){
+      
+      //char gpsMessage[100];
+      //char tempStr[40];
+      // $$ ID, count, HH:MM:SS,Lat,lng,alt,Speed,Heading,sats,int temp,ext temp,pressure,humidity 
+      strcpy(gpsMessage,"$$");
+      strcat(gpsMessage,callsign);
+      
+      snprintf(tempStr,sizeof(tempStr),",%d,%02d:%02d:%02d,",GPS.flightCount,GPS.Hours,GPS.Minutes,GPS.Seconds);
+      strcat(gpsMessage,tempStr);
+      // convert using dtostrf() will convert float or double
+      dtostrf(GPS.Latitude,2,6,tempStr);
+      strcat(gpsMessage,tempStr);
+
+      dtostrf(GPS.Longitude,2,6,tempStr);
+      strcat(gpsMessage,",");
+      strcat(gpsMessage,tempStr);
+
+      ltoa(GPS.Altitude,tempStr,10);
+      strcat(gpsMessage,",");
+      strcat(gpsMessage,tempStr);
+
+      snprintf(tempStr,40,",%d,%d,%d,%d,%d,%d,%d",GPS.Speed,GPS.Direction,GPS.Satellites,0,0,0,0);
+      strcat(gpsMessage,tempStr);
+      
+      int Count = strlen(gpsMessage);
+
+      unsigned int CRC = 0xffff;           // Seed
+      //unsigned int xPolynomial = 0x1021;
+      // do CRC calc and append to message
+      for (int i = 2; i < Count; i++)
+      {   
+          CRC ^= (((unsigned int)gpsMessage[i]) << 8);
+          for (int j=0; j<8; j++)
+          {
+              if (CRC & 0x8000)
+                  CRC = (CRC << 1) ^ 0x1021;
+              else
+                  CRC <<= 1;
+          }
+      }
+
+      gpsMessage[Count++] = '*';
+      gpsMessage[Count++] = Hex((CRC >> 12) & 15);
+      gpsMessage[Count++] = Hex((CRC >> 8) & 15);
+      gpsMessage[Count++] = Hex((CRC >> 4) & 15);
+      gpsMessage[Count++] = Hex(CRC & 15);
+      gpsMessage[Count++] = '\n';  
+      gpsMessage[Count++] = '\0';
+  
+      //Serial.println(gpsMessage);
+  }
+
+  
+
+int process_ssdv(camera_fb_t *fb){
+
+  int index=0,c = 0,ssdvPacketCount=0;
+
+  // initialise ssdv config structure
+  ssdv_enc_init(&ssdv, SSDV_TYPE_NOFEC, (char *)callsign, imageID++, ssdvQuality);
+  // set the output lora packet buffer for ssdv where the final ssdv packet will end up
+  ssdv_enc_set_buffer(&ssdv, loraBuff);
+  Serial.print("Sending Image: length = ");
+  Serial.println(fb->len);
+
+  while(1){
+
+    checkGps();
+    if(GPS.isValid){
+      // test to see if GPS is to be sent
+      if((ssdvPacketCount % INTERLEAVE_TELEM) == 0){
+        buildPITSMessage();
+        LoRa.beginPacket(1);          // initialise implicit/explicit mode and reset FIFO
+        LoRa.write((const uint8_t *)gpsMessage,255);     // load data into FIFO
+        LoRa.endPacket();             // execute transmission return once complete
+
+      Serial.print("lat/lng ");
+      Serial.print(GPS.Latitude);
+      Serial.print("/");
+      Serial.println(GPS.Longitude);
+
+
+      }  
+    }
+   
+  
+    while((c = ssdv_enc_get_packet(&ssdv)) == SSDV_FEED_ME)
+    {
+        //size_t r = fread(imageBuffer, 1, 128, fin);
+        //Serial.print("read into buffer");
+        // read packet worth of bytes from image buffer
+        index += iread(imgBuff, IMG_BUFF_SIZE,fb,index);
+        Serial.print("index = ");
+        Serial.print(index);
+        
+        // ssdv =  struct, imageBuffer = buffer containing image packet, r = size
+        ssdv_enc_feed(&ssdv, imgBuff, IMG_BUFF_SIZE);
+        //Serial.println(" bfed ");
+    }
+    
+    if(c == SSDV_EOI)
+    {
+        Serial.println("ssdv EOI");
+        break;
+    }
+    else if(c != SSDV_OK)
+    {
+        Serial.println("ssdv Error");
+        break;
+    }
+
+    // move lora data backwrds 1 byte This seems needed for pits gateway to read it. (TT7)
+    for(uint16_t i = 0; i < 256; i++) {
+      loraBuff[i] = loraBuff[i+1];
+    }
+
+    
+    // lora transmit
+    Serial.print("packet sent");
+    Serial.println(ssdvPacketCount);
+    delay(10);
+    LoRa.beginPacket(1);          // initialise implicit/explicit mode and reset FIFO
+    LoRa.write(loraBuff,255);     // load data into FIFO
+    LoRa.endPacket();             // execute transmission return once complete
+    ssdvPacketCount++;
+    delay(10);
+
+    //fwrite(pkt, 1, SSDV_PKT_SIZE, fout);
+    
+  }
+}
+  
   
 
 
 void setup() {
   Serial.begin(115200);
   internet_connected = false;
+  Wire.begin();//Change to Wire.begin() for non ESP.
+  // GPS
+  Serial2.begin(9600,SERIAL_8N1,2,16);
 
+  // set up lora SPI
+  //SPI.begin(14,12,13,15);    // wrks for ESP32 DOIT board 
+  SPI.begin(14,12,13,LORA_CSS);    // use GPIO04 - HS2 DATA1 as NSS 
+  SPI.setFrequency(4000000);
+  //spiTest.begin(14,12,13,15);    // wrks for ESP32 DOIT board 
+  //LoRa.setPins(15,-1,-1); 
+  LoRa.setPins(LORA_CSS,-1,-1); 
 
-// set up lora SPI
-SPI.begin(14,12,13,15);    // wrks for ESP32 DOIT board 
-SPI.setFrequency(4000000);
-//spiTest.begin(14,12,13,15);    // wrks for ESP32 DOIT board 
-//LoRa.setPins(15,-1,4); 
-LoRa.setPins(15,-1,-1); 
-if(!LoRa.begin(frq)){
-  Serial.println("Lora not detected");
+  if(!LoRa.begin(frq)){
+    Serial.println("Lora not detected");
 }
-Serial.println("LORA OK");
+  Serial.println("LORA OK");
 
-LoRa.setSpreadingFactor(6);
-LoRa.setSignalBandwidth(20.8E3);
-LoRa.setCodingRate4(5);
-  
-//LoRa.setPreambleLength(preambleLength);
-LoRa.setSyncWord(0x12);
-LoRa.enableCrc();
+  LoRa.setSpreadingFactor(6);
+  LoRa.setSignalBandwidth(20.8E3);
+  LoRa.setCodingRate4(5);
+    
+  //LoRa.setPreambleLength(preambleLength);
+  LoRa.setSyncWord(0x12);
+  LoRa.enableCrc();
 
 /*
   if (init_wifi()) { // Connected to WiFi
@@ -221,9 +384,9 @@ LoRa.enableCrc();
     config.jpeg_quality = 12;
     config.fb_count = 1;
   }
-
+// overide the above for testing
   config.frame_size = FRAMESIZE_VGA;
-  config.jpeg_quality = 12;
+  config.jpeg_quality = 10;
   config.fb_count = 1;
 
   // camera init
@@ -376,4 +539,6 @@ void loop()
     last_capture_millis = millis();
     save_photo();
   }
+
+
 }
