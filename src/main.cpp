@@ -311,7 +311,6 @@ int process_ssdv(camera_fb_t *fb){
   }
 }
   
-  
 
 
 void setup() {
@@ -320,6 +319,10 @@ void setup() {
   Wire.begin();//Change to Wire.begin() for non ESP.
   // GPS
   Serial2.begin(9600,SERIAL_8N1,2,16);
+
+// turn off wifi and BLE for flight mode
+  WiFi.mode(WIFI_OFF);
+  btStop();
 
   // set up lora SPI
   //SPI.begin(14,12,13,15);    // wrks for ESP32 DOIT board 
