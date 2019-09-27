@@ -116,9 +116,10 @@ int checkGps(){
   
   gpsSerialActive = false;
   while (Serial2.available() > 0){
-
+    char dat = Serial2.read();
     gpsSerialActive = true;
-    gps.encode(Serial2.read());
+    gps.encode(dat);
+
 
   }
   if(gpsSerialActive){
@@ -318,7 +319,7 @@ void setup() {
   internet_connected = false;
   Wire.begin();//Change to Wire.begin() for non ESP.
   // GPS
-  Serial2.begin(9600,SERIAL_8N1,2,16);
+  Serial2.begin(9600,SERIAL_8N1,2,16,false);
 
 // turn off wifi and BLE for flight mode
   WiFi.mode(WIFI_OFF);
